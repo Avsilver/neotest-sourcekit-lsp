@@ -131,11 +131,23 @@ local function refresh_changed_test_files()
 	for path, was_present in pairs(discovered_test_files) do
 		local is_present = files.exists(path) == true
 		if is_present ~= was_present then
-			-- Neotest rescans the containing directory on BufDelete; external
-			-- file-manager changes need to trigger that refresh explicitly.
+			-- Neotest rescans the containing directory on BufDelete. If the
+			-- deleted file's parent directory was removed too, target the nearest
+			-- existing ancestor so Neotest can rebuild the remaining tree.
+			local event_path = path
+			local directory = vim.fs.dirname(path)
+			while directory and not files.exists(directory) do
+				event_path = directory
+				local parent = vim.fs.dirname(directory)
+				if parent == directory then
+					break
+				end
+				directory = parent
+			end
+
 			local refreshed = pcall(vim.api.nvim_exec_autocmds, "BufDelete", {
 				group = "neotest.Client",
-				pattern = path,
+				pattern = event_path,
 				modeline = false,
 			})
 			if refreshed then
@@ -152,7 +164,7 @@ local function install_deletion_refresh()
 	end
 	deletion_refresh_installed = true
 	local group = vim.api.nvim_create_augroup("neotest-sourcekit-lsp-deletion-refresh", { clear = true })
-	vim.api.nvim_create_autocmd({ "FocusGained", "CursorHold" }, {
+	vim.api.nvim_create_autocmd({ "BufEnter", "FocusGained", "CursorHold", "CursorHoldI" }, {
 		group = group,
 		callback = refresh_changed_test_files,
 	})
