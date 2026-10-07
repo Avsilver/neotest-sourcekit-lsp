@@ -84,10 +84,10 @@ describe("neotest-sourcekit-lsp.util", function()
   it("matches Swift module names normalized from hyphenated targets", function()
     local expected = {
       type = "test",
-      id = "/repo/Tests/bw_alfredTests/File.swift::testExample",
+      id = "/repo/Tests/sample_appTests/File.swift::testExample",
     }
 
-    local found = util.find_position({ expected }, "bw-alfredTests", "testExample()")
+    local found = util.find_position({ expected }, "sample-appTests", "testExample()")
 
     assert.equals(expected, found)
   end)
@@ -95,11 +95,11 @@ describe("neotest-sourcekit-lsp.util", function()
   it("matches a unique test in a build-server workspace layout", function()
     local expected = {
       type = "test",
-      id = "/repo/Components/Infrastructure/GRDBFocusRepositoryTests.swift::GRDBFocusRepositoryTests::update",
-      path = "/repo/Components/Infrastructure/GRDBFocusRepositoryTests.swift",
+      id = "/repo/Components/Networking/RepositoryTests.swift::RepositoryTests::update",
+      path = "/repo/Components/Networking/RepositoryTests.swift",
     }
 
-    local found = util.find_position({ expected }, "LTPInfrastructureTests.GRDBFocusRepositoryTests", "update()")
+    local found = util.find_position({ expected }, "InfrastructureTests.RepositoryTests", "update()")
 
     assert.equals(expected, found)
   end)
@@ -109,18 +109,18 @@ describe("neotest-sourcekit-lsp.util", function()
       type = "test",
       module = "OtherTests",
       path = "/repo/Other/Tests.swift",
-      id = "/repo/Other/Tests.swift::GRDBFocusRepositoryTests::update",
+      id = "/repo/Other/Tests.swift::RepositoryTests::update",
     }
     local expected = {
       type = "test",
-      module = "LTPInfrastructureTests",
-      path = "/repo/Components/Infrastructure/Tests.swift",
-      id = "/repo/Components/Infrastructure/Tests.swift::GRDBFocusRepositoryTests::update",
+      module = "InfrastructureTests",
+      path = "/repo/Components/Networking/Tests.swift",
+      id = "/repo/Components/Networking/Tests.swift::RepositoryTests::update",
     }
 
     local found = util.find_position(
       { other_target, expected },
-      "LTPInfrastructureTests.GRDBFocusRepositoryTests",
+      "InfrastructureTests.RepositoryTests",
       "update()"
     )
 
@@ -130,12 +130,12 @@ describe("neotest-sourcekit-lsp.util", function()
   it("matches a unique position when the SourceKit module differs from JUnit's target name", function()
     local expected = {
       type = "test",
-      module = "LTPDomain",
-      path = "/repo/Packages/LTPDomain/Tests/LTPDomainTests/LTPDomainTests.swift",
-      id = "/repo/Packages/LTPDomain/Tests/LTPDomainTests/LTPDomainTests.swift::example",
+      module = "Core",
+      path = "/repo/Packages/Core/Tests/CoreTests/CoreTests.swift",
+      id = "/repo/Packages/Core/Tests/CoreTests/CoreTests.swift::example",
     }
 
-    local found = util.find_position({ expected }, "LTPDomainTests", "example()")
+    local found = util.find_position({ expected }, "CoreTests", "example()")
 
     assert.equals(expected, found)
   end)
@@ -143,12 +143,34 @@ describe("neotest-sourcekit-lsp.util", function()
   it("falls back to the test identifier when JUnit and SourceKit suite names differ", function()
     local expected = {
       type = "test",
-      module = "LTPDomain",
-      path = "/repo/Packages/LTPDomain/Tests/LTPDomain2Tests/LTPDomain2Tests.swift",
-      id = "/repo/Packages/LTPDomain/Tests/LTPDomain2Tests/LTPDomain2Tests.swift::a1",
+      module = "Core",
+      path = "/repo/Packages/Core/Tests/LegacyTests/LegacyTests.swift",
+      id = "/repo/Packages/Core/Tests/LegacyTests/LegacyTests.swift::a1",
     }
 
-    local found = util.find_position({ expected }, "LTPDomain2Tests.LTPDomain2Tests", "a1()")
+    local found = util.find_position({ expected }, "LegacyTests.LegacySuite", "a1()")
+
+    assert.equals(expected, found)
+  end)
+
+  it("scopes result position matching to the package that ran", function()
+    local sibling = {
+      type = "test",
+      id = "/repo/Packages/Other/Tests/Tests.swift::Suite::testSame",
+      path = "/repo/Packages/Other/Tests/Tests.swift",
+    }
+    local expected = {
+      type = "test",
+      id = "/repo/Packages/SamplePackage/Tests/SamplePackageTests/Tests.swift::Suite::testSame",
+      path = "/repo/Packages/SamplePackage/Tests/SamplePackageTests/Tests.swift",
+    }
+
+    local found = util.find_position(
+      { sibling, expected },
+      "SamplePackageTests.Suite",
+      "testSame()",
+      "/repo/Packages/SamplePackage"
+    )
 
     assert.equals(expected, found)
   end)

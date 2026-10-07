@@ -31,8 +31,9 @@ end
 ---@param list neotest.Position[]
 ---@param class_name string
 ---@param test_name string
+---@param cwd? string
 ---@return neotest.Position?
-M.find_position = function(list, class_name, test_name)
+M.find_position = function(list, class_name, test_name, cwd)
   local parts = vim.split(class_name, ".", { plain = true })
   local module = parts[1]
   if not module then
@@ -59,7 +60,10 @@ M.find_position = function(list, class_name, test_name)
   local function find_candidates(match_suffix)
     local matches = {}
     for _, item in ipairs(list) do
-      if item.type == "test" and vim.endswith(item.id, match_suffix) then
+      local item_path = item.path or (item.id and item.id:match("^(.-)::")) or ""
+      local package_root = cwd and cwd:gsub("[/\\]+$", "")
+      local in_package = not package_root or item_path == package_root or vim.startswith(item_path, package_root .. "/")
+      if item.type == "test" and in_package and vim.endswith(item.id, match_suffix) then
         table.insert(matches, item)
       end
     end

@@ -64,14 +64,115 @@ local function normalize_path(path, root)
 	return vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
 end
 
+local function find_packages(path)
+	local manifests = vim.fs.find("Package.swift", {
+		path = normalize_path(path),
+		upward = false,
+		limit = math.huge,
+		type = "file",
+	})
+	local package_roots = {}
+	for _, manifest in ipairs(manifests) do
+		if not manifest:match("/%.build/") and not manifest:match("/%.git/") and not manifest:match("/%.swiftpm/") then
+			table.insert(package_roots, normalize_path(vim.fs.dirname(manifest)))
+		end
+	end
+	table.sort(package_roots)
+	return package_roots
+end
+
+local package_workspace_cache = {}
+local function common_package_root(package_root)
+	package_root = normalize_path(package_root)
+	if package_workspace_cache[package_root] then
+		return package_workspace_cache[package_root]
+	end
+
+	-- A package that contains nested packages is itself their common root.
+	if #find_packages(package_root) > 1 then
+		package_workspace_cache[package_root] = package_root
+		return package_root
+	end
+
+	local parent = vim.fs.dirname(package_root)
+	for _ = 1, 4 do
+		if not parent or parent == package_root then
+			break
+		end
+		local packages = find_packages(parent)
+		local contains_package = vim.list_contains(packages, package_root)
+		if contains_package and #packages > 1 then
+			package_workspace_cache[package_root] = parent
+			return parent
+		end
+		local next_parent = vim.fs.dirname(parent)
+		if next_parent == parent then
+			break
+		end
+		parent = next_parent
+	end
+
+	package_workspace_cache[package_root] = package_root
+	return package_root
+end
+
+local function swift_package_root(path)
+	return files.match_root_pattern("Package.swift")(path)
+end
+
+local discovered_test_files = {}
+
+local function refresh_changed_test_files()
+	local ok, autocmds = pcall(vim.api.nvim_get_autocmds, { event = "BufDelete", group = "neotest.Client" })
+	if not ok or #autocmds == 0 then
+		return
+	end
+
+	for path, was_present in pairs(discovered_test_files) do
+		local is_present = files.exists(path) == true
+		if is_present ~= was_present then
+			-- Neotest rescans the containing directory on BufDelete; external
+			-- file-manager changes need to trigger that refresh explicitly.
+			local refreshed = pcall(vim.api.nvim_exec_autocmds, "BufDelete", {
+				group = "neotest.Client",
+				pattern = path,
+				modeline = false,
+			})
+			if refreshed then
+				discovered_test_files[path] = is_present
+			end
+		end
+	end
+end
+
+local deletion_refresh_installed = false
+local function install_deletion_refresh()
+	if deletion_refresh_installed then
+		return
+	end
+	deletion_refresh_installed = true
+	local group = vim.api.nvim_create_augroup("neotest-sourcekit-lsp-deletion-refresh", { clear = true })
+	vim.api.nvim_create_autocmd({ "FocusGained", "CursorHold" }, {
+		group = group,
+		callback = refresh_changed_test_files,
+	})
+end
+
 local M = {
 	name = "neotest-sourcekit-lsp",
 	root = function(path)
-		-- Test execution uses SwiftPM (`swift test`), so its package root must
-		-- take precedence over the possibly broader build-server workspace root.
-		local package_root = files.match_root_pattern("Package.swift")(path)
+		-- Group nested Swift packages under their nearest common directory so
+		-- Neotest can build one tree for a multi-package workspace.
+		if vim.fn.isdirectory(path) == 1 then
+			local packages = find_packages(path)
+			if #packages > 1 then
+				return normalize_path(path)
+			end
+		end
+
+		local package_root = swift_package_root(path)
 		if package_root then
-			return package_root
+			return common_package_root(package_root)
 		end
 		-- Fall back to the LSP workspace root for non-SwiftPM projects.
 		local client = client_for_file(path)
@@ -283,6 +384,8 @@ end
 ---@param file_path string
 ---@return neotest.Tree
 M.discover_positions = function(file_path)
+	install_deletion_refresh()
+	discovered_test_files[normalize_path(file_path)] = true
 	-- Prefer test discovery through sourcekit-lsp's `workspace/tests` request
 	-- (works for XCTest + Swift Testing, includes display names/tags/disabled
 	-- state and exact ranges). Fall back to the treesitter query when no
@@ -292,49 +395,20 @@ M.discover_positions = function(file_path)
 		local items, err = request_workspace_tests(client)
 		if items then
 			local positions = M._items_to_positions(items, file_path, client.config and client.config.root_dir)
-			local has_test_position = false
-			for _, position in ipairs(positions) do
-				if position.type == "test" then
-					has_test_position = true
-					break
-				end
-			end
-			if not has_test_position then
-				local item_details = {}
-				local function collect(items_to_collect)
-					for _, item in ipairs(items_to_collect or {}) do
-						local uri = item.location and item.location.uri
-						table.insert(item_details, {
-							id = item.id,
-							label = item.label,
-							uri = uri,
-							path = uri and vim.uri_to_fname(uri) or nil,
-							children = #(item.children or {}),
-						})
-						collect(item.children)
-					end
-				end
-				collect(items)
-				logger.debug(
-					"workspace/tests produced no test positions for "
-						.. file_path
-						.. "; LSP root: "
-						.. tostring(client.config and client.config.root_dir)
-						.. "; returned items: "
-						.. vim.inspect(item_details)
-				)
-			else
-				return lib.positions.parse_tree(positions, {
+			local tree = lib.positions.parse_tree(positions, {
 					nested_tests = true,
 					require_namespaces = false,
 					position_id = M._position_id,
 				})
+			for _, position in tree:iter() do
+				if position.type == "test" then
+					return tree
+				end
 			end
 		else
 			logger.error("sourcekit-lsp workspace/tests failed: " .. vim.inspect(err))
 		end
 	end
-	logger.debug("Falling back to Tree-sitter discovery for " .. file_path)
 	return M._treesitter_discover(file_path)
 end
 
@@ -406,7 +480,7 @@ local function get_dap_config(test_name)
 		end
 		args["--test-bundle-path"] = executable
 	else
-		logger.debug("Unsupported OS")
+		logger.error("Unsupported OS for Swift test debugging")
 		return nil
 	end
 
@@ -438,7 +512,7 @@ local function ensure_test_bundle_is_build()
 		"debug",
 	})
 	if code ~= 0 then
-		logger.debug("Failed to build test bundle: " .. result.stderr)
+			logger.error("Failed to build test bundle: " .. result.stderr)
 	end
 	return code
 end
@@ -469,6 +543,84 @@ local function find_test_target(package_directory, file_name)
 	return nil
 end
 
+local function package_has_tests(tree, package_root)
+  for _, node in tree:iter_nodes() do
+    local position = node:data()
+    local path = position.path and normalize_path(position.path)
+    if
+      position.type == "test"
+      and path
+      and vim.startswith(path, package_root .. Path.path.sep)
+    then
+      return true
+    end
+  end
+  return false
+end
+
+local function swift_test_spec(cwd, filters)
+  local results_path = async.fn.tempname() .. "junit.xml"
+  local command = {
+    "swift",
+    "test",
+    "--enable-swift-testing",
+    "--disable-xctest",
+    "-c",
+    "debug",
+    "--xunit-output",
+    results_path,
+    "-q",
+  }
+
+  if #filters > 0 then
+    table.insert(command, "--filter")
+    for _, filter in ipairs(filters) do
+      table.insert(command, filter)
+    end
+  end
+
+  return {
+    command = command,
+    context = { results_path = results_path },
+    cwd = cwd,
+  }
+end
+
+local function packages_test_spec(packages, cwd)
+  local results_files = {}
+  local command = {
+    "sh",
+    "-c",
+    [[
+status=0
+while [ "$#" -gt 0 ]; do
+  package_path=$1
+  results_path=$2
+  shift 2
+  swift test --package-path "$package_path" --enable-swift-testing --disable-xctest -c debug --xunit-output "$results_path" -q
+  if [ "$?" -ne 0 ]; then
+    status=1
+  fi
+done
+exit "$status"
+]],
+    "neotest-sourcekit-lsp",
+  }
+
+  for _, package_root in ipairs(packages) do
+    local results_path = async.fn.tempname() .. "junit.xml"
+    table.insert(command, package_root)
+    table.insert(command, results_path)
+    table.insert(results_files, { path = results_path, cwd = package_root })
+  end
+
+  return {
+    command = command,
+    context = { results_files = results_files },
+    cwd = cwd,
+  }
+end
+
 ---@async
 ---@param args neotest.RunArgs
 ---@return neotest.RunSpec|neotest.RunSpec[]|nil
@@ -478,8 +630,33 @@ function M.build_spec(args)
 		return nil
 	end
 	local position = args.tree:data()
-	local junit_folder = async.fn.tempname()
-	local cwd = assert(M.root(position.path), "could not locate root directory of " .. position.path)
+
+  if position.type == "dir" then
+    local packages = find_packages(position.path)
+    if #packages > 0 then
+      local is_package_root = false
+      local packages_with_tests = {}
+      for _, package_root in ipairs(packages) do
+        if package_root == normalize_path(position.path) then
+          is_package_root = true
+        end
+        if package_has_tests(args.tree, package_root) then
+          table.insert(packages_with_tests, package_root)
+        end
+      end
+      if not is_package_root then
+        if #packages_with_tests > 0 then
+          return packages_test_spec(packages_with_tests, position.path)
+        end
+        return nil
+      end
+    end
+  end
+
+	local cwd = assert(
+		swift_package_root(position.path) or M.root(position.path),
+		"could not locate root directory of " .. position.path
+	)
 
 	if args.strategy == "dap" then
 		-- id pattern /Users/name/project/Tests/ProjectTests/fileName.swift::Suite::testName
@@ -515,17 +692,6 @@ function M.build_spec(args)
 		}
 	end
 
-	local command = {
-		"swift",
-		"test",
-		"--enable-swift-testing",
-		"--disable-xctest",
-		"-c",
-		"debug",
-		"--xunit-output",
-		junit_folder .. "junit.xml",
-		"-q",
-	}
 	local filters = {}
 	if position.type == "file" then
 		table.insert(filters, "/" .. position.name)
@@ -549,20 +715,7 @@ function M.build_spec(args)
 		table.insert(filters, position.name)
 	end
 
-	if #filters > 0 then
-		table.insert(command, "--filter")
-		for _, filter in ipairs(filters) do
-			table.insert(command, filter)
-		end
-	end
-
-	return {
-		command = command,
-		context = {
-			results_path = junit_folder .. "junit.xml",
-		},
-		cwd = cwd,
-	}
+  return swift_test_spec(cwd, filters)
 end
 
 ---Parse the output of swift test to get the line number and error message
@@ -638,70 +791,70 @@ function M.results(spec, result, tree)
 	end
 	local raw_output = files.read_lines(result.output)
 
-	if context.results_path and files.exists(context.results_path) then
-		local root = xml.parse(files.read(context.results_path))
-
-		for _, testsuite in ipairs(xml_as_list(root.testsuites.testsuite)) do
-			for _, testcase in ipairs(xml_as_list(testsuite.testcase)) do
-				local test_position = util.find_position(nodes, testcase._attr.classname, testcase._attr.name)
-				if test_position ~= nil then
-					if testcase.failure then
-						local line_number, error_message =
-							parse_errors(raw_output, test_position, util.get_prefix(testcase._attr.name, "("))
-						test_results[test_position.id] = {
-							status = "failed",
-						}
-						if line_number and error_message then
-							test_results[test_position.id].errors = {
-								{ line = line_number, message = error_message },
+	local results_files = context.results_files or {}
+	if context.results_path then
+		table.insert(results_files, { path = context.results_path, cwd = spec.cwd })
+	end
+	local has_results_file = false
+	for _, results_file in ipairs(results_files) do
+		if files.exists(results_file.path) then
+			has_results_file = true
+			local root = xml.parse(files.read(results_file.path))
+			for _, testsuite in ipairs(xml_as_list(root.testsuites.testsuite)) do
+				for _, testcase in ipairs(xml_as_list(testsuite.testcase)) do
+					local test_position = util.find_position(
+						nodes,
+						testcase._attr.classname,
+						testcase._attr.name,
+						results_file.cwd or spec.cwd
+					)
+					if test_position ~= nil then
+						if testcase.failure then
+							local line_number, error_message =
+								parse_errors(raw_output, test_position, util.get_prefix(testcase._attr.name, "("))
+							test_results[test_position.id] = {
+								status = "failed",
+							}
+							if line_number and error_message then
+								test_results[test_position.id].errors = {
+									{ line = line_number, message = error_message },
+								}
+							end
+						else
+							test_results[test_position.id] = {
+								status = "passed",
 							}
 						end
-					else
-						test_results[test_position.id] = {
-							status = "passed",
-						}
-					end
-				else
-					local position_details = {}
-					for _, node in ipairs(nodes) do
-						table.insert(position_details, {
-							id = node.id,
-							module = node.module,
-							path = node.path,
-							name = node.name,
-							identifier = node.identifier,
-						})
-					end
-					logger.debug(
-						"Position not found: "
-							.. testcase._attr.classname
-							.. "/"
-							.. testcase._attr.name
-							.. "; run tree: "
-							.. vim.inspect({
-								type = position.type,
-								path = position.path,
-								name = position.name,
-								id = position.id,
-							})
-							.. "; discovered positions: "
-							.. vim.inspect(position_details)
-					)
+				end
 				end
 			end
 		end
-	elseif context.position_id ~= nil then
+	end
+	if not has_results_file and context.position_id ~= nil then
 		test_results[context.position_id] = {
 			status = "failed",
 			output = result.output,
 			short = table.concat(raw_output, "\n"),
 		}
 	end
+
+	-- A leaf run has an unambiguous result even if SwiftPM's JUnit names do not
+	-- match the SourceKit position ID exactly.
+	if position.type == "test" and test_results[position.id] == nil then
+		local status = result.code == 0 and "passed" or "failed"
+		test_results[position.id] = { status = status }
+		if status == "failed" then
+			test_results[position.id].output = result.output
+			test_results[position.id].short = table.concat(raw_output, "\n")
+		end
+	end
+
 	return test_results
 end
 
 setmetatable(M, {
 	__call = function(_, opts)
+		install_deletion_refresh()
 		opts = opts or {}
 		if opts.log_level then
 			logger:set_level(opts.log_level)
