@@ -31,9 +31,8 @@ end
 ---@param list neotest.Position[]
 ---@param class_name string
 ---@param test_name string
----@param cwd string
 ---@return neotest.Position?
-M.find_position = function(list, class_name, test_name, cwd)
+M.find_position = function(list, class_name, test_name)
   local parts = vim.split(class_name, ".", { plain = true })
   local module = parts[1]
   if not module then
@@ -53,25 +52,71 @@ M.find_position = function(list, class_name, test_name, cwd)
     suffix = separator .. test_name_clean
   end
 
-  -- Normalize hyphens and underscores because Swift replaces hyphens in folder names
-  -- with underscores in compiled module names (e.g. bw-alfredTests -> bw_alfredTests).
+  -- SourceKit-LSP IDs carry the test target/module. Use that where available;
+  -- filesystem layout is only a disambiguation hint for older/tree-sitter
+  -- positions, since build-server workspaces do not require Tests/<module>.
   local normalized_module = string.gsub(module, "%-", "_")
-  local prefix = string.gsub(cwd .. "/Tests/" .. normalized_module, "%-", "_")
-  local prefix_fallback = string.gsub(cwd .. "/" .. normalized_module, "%-", "_")
+  local function find_candidates(match_suffix)
+    local matches = {}
+    for _, item in ipairs(list) do
+      if item.type == "test" and vim.endswith(item.id, match_suffix) then
+        table.insert(matches, item)
+      end
+    end
+    return matches
+  end
 
-  for _, item in ipairs(list) do
-    if item.type == "test" and vim.endswith(item.id, suffix) then
-      local normalized_item_id = string.gsub(item.id, "%-", "_")
-      if
-        vim.startswith(normalized_item_id, prefix)
-        or vim.startswith(normalized_item_id, prefix_fallback)
-        or string.find(normalized_item_id, "/" .. normalized_module .. "/")
-      then
-        return item
+  local candidates = find_candidates(suffix)
+  -- JUnit class names and SourceKit's suite hierarchy are not always identical
+  -- (notably for top-level Swift Testing tests). Fall back to the test
+  -- identifier only, then disambiguate below.
+  if #candidates == 0 then
+    candidates = find_candidates(separator .. test_name_clean)
+  end
+
+  if #candidates == 0 then
+    return nil
+  end
+
+  local function normalize(value)
+    return string.gsub(value or "", "%-", "_")
+  end
+
+  local module_matches = {}
+  for _, item in ipairs(candidates) do
+    if item.module and item.module ~= "" then
+      if normalize(item.module) == normalized_module then
+        table.insert(module_matches, item)
       end
     end
   end
+  if #module_matches == 1 then
+    return module_matches[1]
+  elseif #module_matches > 1 then
+    candidates = module_matches
+  end
 
+  local path_matches = {}
+  for _, item in ipairs(candidates) do
+    local item_path = item.path or (item.id and item.id:match("^(.-)::")) or ""
+    for segment in string.gmatch(item_path, "[^/]+") do
+      if normalize(segment) == normalized_module then
+        table.insert(path_matches, item)
+        break
+      end
+    end
+  end
+  if #path_matches == 1 then
+    return path_matches[1]
+  elseif #path_matches > 1 then
+    return nil
+  end
+
+  -- A unique class/suite/test match is sufficient when the target name is not
+  -- represented in the discovered position's metadata or path.
+  if #candidates == 1 then
+    return candidates[1]
+  end
   return nil
 end
 

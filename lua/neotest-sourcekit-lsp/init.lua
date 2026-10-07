@@ -56,14 +56,24 @@ local function request_workspace_tests(client)
 	return res.result, res.err
 end
 
+local function normalize_path(path, root)
+	local is_absolute = path:match("^/") ~= nil or path:match("^%a:[/\\]") ~= nil
+	if not is_absolute and root then
+		path = root:gsub("[/\\]+$", "") .. Path.path.sep .. path
+	end
+	return vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
+end
+
 local M = {
 	name = "neotest-sourcekit-lsp",
 	root = function(path)
+		-- Test execution uses SwiftPM (`swift test`), so its package root must
+		-- take precedence over the possibly broader build-server workspace root.
 		local package_root = files.match_root_pattern("Package.swift")(path)
 		if package_root then
 			return package_root
 		end
-		-- Fall back to the LSP workspace root so Xcode projects don't crash discovery.
+		-- Fall back to the LSP workspace root for non-SwiftPM projects.
 		local client = client_for_file(path)
 		return client and client.config and client.config.root_dir or nil
 	end,
@@ -200,8 +210,10 @@ end
 ---(file + namespaces + tests) for the given file.
 ---@param items any[]
 ---@param file_path string
+---@param root_path string?
 ---@return neotest.Position[]
-function M._items_to_positions(items, file_path)
+function M._items_to_positions(items, file_path, root_path)
+	file_path = normalize_path(file_path, root_path)
 	local line_count = #vim.fn.readfile(file_path)
 	---@type neotest.Position[]
 	local positions = {
@@ -215,7 +227,7 @@ function M._items_to_positions(items, file_path)
 
 	local function visit(item, parent_id)
 		local loc = item.location
-		local path = loc and loc.uri and vim.uri_to_fname(loc.uri) or nil
+		local path = loc and loc.uri and normalize_path(vim.uri_to_fname(loc.uri), root_path) or nil
 		local is_suite = item.children ~= nil and #item.children > 0
 		local id = item.id or ""
 
@@ -238,6 +250,7 @@ function M._items_to_positions(items, file_path)
 					path = file_path,
 					name = item.label or identifier,
 					identifier = identifier,
+					module = module_of(id),
 					range = { range.start.line, range.start.character, range["end"].line, range["end"].character },
 				})
 			end
@@ -278,15 +291,50 @@ M.discover_positions = function(file_path)
 	if client then
 		local items, err = request_workspace_tests(client)
 		if items then
-			local positions = M._items_to_positions(items, file_path)
-			return lib.positions.parse_tree(positions, {
-				nested_tests = true,
-				require_namespaces = false,
-				position_id = M._position_id,
-			})
+			local positions = M._items_to_positions(items, file_path, client.config and client.config.root_dir)
+			local has_test_position = false
+			for _, position in ipairs(positions) do
+				if position.type == "test" then
+					has_test_position = true
+					break
+				end
+			end
+			if not has_test_position then
+				local item_details = {}
+				local function collect(items_to_collect)
+					for _, item in ipairs(items_to_collect or {}) do
+						local uri = item.location and item.location.uri
+						table.insert(item_details, {
+							id = item.id,
+							label = item.label,
+							uri = uri,
+							path = uri and vim.uri_to_fname(uri) or nil,
+							children = #(item.children or {}),
+						})
+						collect(item.children)
+					end
+				end
+				collect(items)
+				logger.debug(
+					"workspace/tests produced no test positions for "
+						.. file_path
+						.. "; LSP root: "
+						.. tostring(client.config and client.config.root_dir)
+						.. "; returned items: "
+						.. vim.inspect(item_details)
+				)
+			else
+				return lib.positions.parse_tree(positions, {
+					nested_tests = true,
+					require_namespaces = false,
+					position_id = M._position_id,
+				})
+			end
+		else
+			logger.error("sourcekit-lsp workspace/tests failed: " .. vim.inspect(err))
 		end
-		logger.error("sourcekit-lsp workspace/tests failed: " .. vim.inspect(err))
 	end
+	logger.debug("Falling back to Tree-sitter discovery for " .. file_path)
 	return M._treesitter_discover(file_path)
 end
 
@@ -595,7 +643,7 @@ function M.results(spec, result, tree)
 
 		for _, testsuite in ipairs(xml_as_list(root.testsuites.testsuite)) do
 			for _, testcase in ipairs(xml_as_list(testsuite.testcase)) do
-				local test_position = util.find_position(nodes, testcase._attr.classname, testcase._attr.name, spec.cwd)
+				local test_position = util.find_position(nodes, testcase._attr.classname, testcase._attr.name)
 				if test_position ~= nil then
 					if testcase.failure then
 						local line_number, error_message =
@@ -614,7 +662,31 @@ function M.results(spec, result, tree)
 						}
 					end
 				else
-					logger.debug("Position not found: " .. testcase._attr.classname .. "/" .. testcase._attr.name)
+					local position_details = {}
+					for _, node in ipairs(nodes) do
+						table.insert(position_details, {
+							id = node.id,
+							module = node.module,
+							path = node.path,
+							name = node.name,
+							identifier = node.identifier,
+						})
+					end
+					logger.debug(
+						"Position not found: "
+							.. testcase._attr.classname
+							.. "/"
+							.. testcase._attr.name
+							.. "; run tree: "
+							.. vim.inspect({
+								type = position.type,
+								path = position.path,
+								name = position.name,
+								id = position.id,
+							})
+							.. "; discovered positions: "
+							.. vim.inspect(position_details)
+					)
 				end
 			end
 		end
